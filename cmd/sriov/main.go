@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"runtime"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -142,6 +143,54 @@ func cmdAdd(args *skel.CmdArgs) error {
 			}
 		}
 		result = newResult
+	}
+
+	/* After IPAM configuration is done, the following needs to handle the case of an IP address being reused by a different pods.
+	 * This is achieved by sending Gratuitous ARPs and/or Unsolicited Neighbor Advertisements unconditionally.
+	 * Although we set arp_notify and ndisc_notify unconditionally on the interface (please see EnableArpAndNdiscNotify()), the kernel
+	 * only sends GARPs/Unsolicited NA when the interface goes from down to up, or when the link-layer address changes on the interfaces.
+	 * These scenarios are perfectly valid and recommended to be enabled for optimal network performance.
+	 * However for our specific case, which the kernel is unaware of, is the reuse of IP addresses across pods where each pod has a different
+	 * link-layer address for it's SRIOV interface. The ARP/Neighbor cache residing in neighbors would be invalid if an IP address is reused.
+	 * In order to update the cache, the GARP/Unsolicited NA packets should be sent for performance reasons. Otherwise, the neighbors
+	 * may be sending packets with the incorrect link-layer address. Eventually, most network stacks would send ARPs and/or Neighbor
+	 * Solicitation packets when the connection is unreachable. This would correct the invalid cache; however this may take a significant
+	 * amount of time to complete.
+	 */
+	if !netConf.DPDKMode {
+		err = netns.Do(func(_ ns.NetNS) error {
+			// Retrieve the interface name in the container.
+			contVeth, err := net.InterfaceByName(args.IfName)
+			if err != nil {
+				return fmt.Errorf("failed to look up interface %q: %v", args.IfName, err)
+			}
+
+			// Check that we have a valid hardware MAC address.
+			if len(contVeth.HardwareAddr) != 6 {
+				return fmt.Errorf("error invalid Ethernet MAC address: %q", contVeth.HardwareAddr)
+			}
+
+			// For all the IP addresses assigned by IPAM, we will sent either a GARP (IPv4) or Unsolicited NA (IPv6).
+			for _, ipc := range result.IPs {
+				var err error
+				if ipc.Address.IP.To4() == nil { // IPv6
+					/* As per RFC 4861, sending unsolicited neighbor advertisements should be considered as a performance
+					 * optimization. It does not reliably update caches in all nodes. The Neighbor Unreachability Detection
+					 * algorithm is more reliable although it may take slightly longer to update.
+					 */
+					err = utils.SendUnsolicitedNeighborAdvertisement(ipc.Address.IP, *contVeth)
+				} else { // IPv4
+					err = utils.SendGratuitousArp(ipc.Address.IP, *contVeth)
+				}
+				if err != nil {
+					return fmt.Errorf("error sending messages for ip %s on interface %q: %v", ipc.Address.IP.String(), args.IfName, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	// Cache NetConf for CmdDel

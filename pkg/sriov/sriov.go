@@ -105,6 +105,7 @@ type pciUtils interface {
 	getSriovNumVfs(ifName string) (int, error)
 	getVFLinkNamesFromVFID(pfName string, vfID int) ([]string, error)
 	getPciAddress(ifName string, vf int) (string, error)
+	enableArpAndNdiscNotify(ifName string) error
 }
 
 type pciUtilsImpl struct{}
@@ -119,6 +120,10 @@ func (p *pciUtilsImpl) getVFLinkNamesFromVFID(pfName string, vfID int) ([]string
 
 func (p *pciUtilsImpl) getPciAddress(ifName string, vf int) (string, error) {
 	return utils.GetPciAddress(ifName, vf)
+}
+
+func (p *pciUtilsImpl) enableArpAndNdiscNotify(ifName string) error {
+	return utils.EnableArpAndNdiscNotify(ifName)
 }
 
 // Manager provides interface invoke sriov nic related operations
@@ -192,7 +197,12 @@ func (s *sriovManager) SetupVF(conf *sriovtypes.NetConf, podifName string, cid s
 			return fmt.Errorf("error setting container interface name %s for %s", linkName, tempName)
 		}
 
-		// 6. Bring IF up in Pod netns
+		// 6. Enable IPv4 ARP notify and IPv6 Network Discovery notify
+		if err := s.utils.enableArpAndNdiscNotify(podifName); err != nil {
+			return fmt.Errorf("failed to enable arp_notify for interface name: %s, %q", podifName, err)
+		}
+
+		// 7. Bring IF up in Pod netns
 		if err := s.nLink.LinkSetUp(linkObj); err != nil {
 			return fmt.Errorf("error bringing interface up in container ns: %q", err)
 		}
